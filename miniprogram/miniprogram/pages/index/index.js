@@ -12,9 +12,25 @@ Page({
   onReady() {
     console.log('Page Ready');
     this.initCamera();
-    // 后续在这里初始化 ONNX 和 OCR 会话
     this.initOnnxSession();
     this.initOcrSession();
+
+    // Initialize the canvas for preprocessing output
+    const modelInputWidth = 224; // MobileNetV2 typical input width
+    const modelInputHeight = 224; // MobileNetV2 typical input height
+    try {
+      this.preprocessedCanvas = wx.createOffscreenCanvas({ type: '2d', width: modelInputWidth, height: modelInputHeight });
+      this.preprocessCtx = this.preprocessedCanvas.getContext('2d');
+      console.log(`Preprocessed canvas (${modelInputWidth}x${modelInputHeight}) initialized.`);
+    } catch (e) {
+      console.error('Failed to create offscreen canvas for preprocessing:', e);
+      wx.showToast({ title: '图像处理模块初始化失败', icon: 'none' });
+    }
+    
+    this.sourceCanvas = null;
+    this.sourceCtx = null;
+    this.lastFrameWidth = 0;
+    this.lastFrameHeight = 0;
   },
 
   onUnload() {
@@ -26,6 +42,11 @@ Page({
     if (this.data.ocrSession) {
       this.data.ocrSession.destroy();
     }
+    // OffscreenCanvas doesn't have a destroy method, JS garbage collection will handle them
+    this.preprocessedCanvas = null;
+    this.preprocessCtx = null;
+    this.sourceCanvas = null;
+    this.sourceCtx = null;
   },
 
   initCamera() {
@@ -69,35 +90,166 @@ Page({
     }
   },
 
-  processFrame(frame) {
-    console.log('开始处理帧...');
-    // 1. TODO: 将帧数据传递给 ONNX 模型进行瓶子检测
-    // const detectedBottles = this.runYoloDetection(frame);
-
-    // 2. TODO: 如果检测到瓶子，裁剪图像区域
-    // if (detectedBottles && detectedBottles.length > 0) {
-    //   const croppedImage = this.cropImage(frame, detectedBottles[0].bbox); // 示例：只处理第一个检测到的瓶子
-      
-    //   // 3. TODO: 将裁剪后的图像传递给 VisionKit OCR 进行识别
-    //   this.runOcr(croppedImage);
-    // } else {
-       // 如果没有检测到瓶子，也需要重置 processing 状态
-       this.setData({ processing: false }); 
-    // }
-    
-    // --- 模拟处理结束 ---
-    // 暂时先直接设置为 false，后续由 OCR 回调或无检测结果时设置
-     setTimeout(() => { this.setData({ processing: false }); }, 100); // 模拟耗时
-    console.log('帧处理结束（模拟）');
+  async processFrame(frame) {
+    if (this.data.onnxSession) {
+      try {
+        const detectionResult = await this.runYoloDetection(frame);
+        
+        if (detectionResult) {
+          console.log('YOLO 检测结果 (来自 await):', detectionResult);
+          this.setData({ processing: false });
+        } else {
+          if (this.data.processing) {
+            this.setData({ processing: false });
+          }
+        }
+      } catch (error) {
+        console.error('processFrame 中调用 runYoloDetection 失败:', error);
+        this.setData({ processing: false });
+      }
+    } else {
+      this.setData({ processing: false });
+    }
   },
 
-  runYoloDetection(frame) {
-    // TODO: 实现 ONNX 推理逻辑
-    console.log('运行YOLO检测（待实现）');
-    // 需要将 frame.data (ArrayBuffer) 转换为 ONNX 模型所需的输入格式
-    // 调用 this.data.onnxSession.run(...)
-    // 解析输出，返回边界框信息
-    return []; // 暂存返回空数组
+  async runYoloDetection(frame) {
+    if (!this.data.onnxSession) {
+      console.error('ONNX会话未初始化 (runYoloDetection)');
+      this.setData({ processing: false });
+      return null;
+    }
+
+    // === IMPORTANT: Configure for the currently loaded model (MobileNetV2 in this case) ===
+    const inputName = 'data'; // <--- 修改这里，与模型匹配
+    const outputName = 'mobilenetv20_output_flatten0_reshape0'; // 这个看起来是正确的
+    const targetWidth = 224;  // MobileNetV2 typical input width
+    const targetHeight = 224; // MobileNetV2 typical input height
+    // === End of model-specific configuration ===
+
+    let preprocessedData; // This will hold the final Float32Array for the model
+
+    try {
+      if (!this.preprocessCtx) {
+        console.error('Preprocess context not initialized!');
+        this.setData({ processing: false });
+        return null;
+      }
+      const { data: frameDataBuffer, width: frameWidth, height: frameHeight } = frame;
+      if (!this.sourceCanvas || this.lastFrameWidth !== frameWidth || this.lastFrameHeight !== frameHeight) {
+        this.sourceCanvas = wx.createOffscreenCanvas({ type: '2d', width: frameWidth, height: frameHeight });
+        this.sourceCtx = this.sourceCanvas.getContext('2d');
+        this.lastFrameWidth = frameWidth;
+        this.lastFrameHeight = frameHeight;
+      }
+      if (!this.sourceCtx) {
+          console.error('Source context not available after attempting initialization!');
+          this.setData({ processing: false });
+          return null;
+      }
+      const originalImageData = this.sourceCtx.createImageData(frameWidth, frameHeight);
+      const rgbaData = new Uint8ClampedArray(frameDataBuffer);
+      originalImageData.data.set(rgbaData);
+      this.sourceCtx.putImageData(originalImageData, 0, 0);
+      this.preprocessCtx.clearRect(0, 0, targetWidth, targetHeight);
+      this.preprocessCtx.drawImage(this.sourceCanvas, 0, 0, frameWidth, frameHeight, 0, 0, targetWidth, targetHeight);
+      const scaledImageData = this.preprocessCtx.getImageData(0, 0, targetWidth, targetHeight);
+      const pixels = scaledImageData.data;
+      const float32Input = new Float32Array(targetWidth * targetHeight * 3);
+      const R_PLANE_OFFSET = 0;
+      const G_PLANE_OFFSET = targetWidth * targetHeight;
+      const B_PLANE_OFFSET = targetWidth * targetHeight * 2;
+      for (let y = 0; y < targetHeight; y++) {
+        for (let x = 0; x < targetWidth; x++) {
+          const HWC_index = (y * targetWidth + x) * 4;
+          const r = pixels[HWC_index + 0] / 255.0;
+          const g = pixels[HWC_index + 1] / 255.0;
+          const b = pixels[HWC_index + 2] / 255.0;
+          const CHW_pixel_index = y * targetWidth + x;
+          float32Input[R_PLANE_OFFSET + CHW_pixel_index] = r;
+          float32Input[G_PLANE_OFFSET + CHW_pixel_index] = g;
+          float32Input[B_PLANE_OFFSET + CHW_pixel_index] = b;
+        }
+      }
+      preprocessedData = float32Input; // <--- 确保 float32Input 是预处理的结果
+      console.log('使用真实的相机帧预处理数据进行推理。');
+
+    } catch (e) {
+      console.error('Error during image preprocessing:', e);
+      this.setData({processing: false});
+      return null;
+    }
+    
+    // === 测试用的虚拟数据部分，现在可以注释掉或移除了 ===
+    // const dummyDataArray = new Float32Array(1 * 3 * targetHeight * targetWidth).fill(0.0);
+    // const currentTestData = dummyDataArray; 
+    // console.log('警告: 当前运行使用的是虚拟全零输入数据进行测试!');
+    // === 测试结束 ===
+    
+    try {
+      // Log the parameters being passed to session.run()
+      const modelInputObject = {
+        data: preprocessedData.buffer, // <--- 使用真实预处理数据的 buffer
+        shape: [1, 3, targetHeight, targetWidth], 
+        type: 'float32'
+      };
+      
+      const onnxRunParams = {
+        [inputName]: modelInputObject 
+      };
+
+      console.log('Type of currentTestData:', Object.prototype.toString.call(preprocessedData));
+      console.log('Is currentTestData a Float32Array?', preprocessedData instanceof Float32Array);
+      if (preprocessedData instanceof Float32Array) {
+        console.log('currentTestData.length:', preprocessedData.length);
+        console.log('currentTestData.byteLength:', preprocessedData.byteLength);
+        console.log('currentTestData.buffer type:', Object.prototype.toString.call(preprocessedData.buffer)); 
+        console.log('currentTestData.buffer byteLength:', preprocessedData.buffer.byteLength); 
+      }
+
+      console.log('ONNX run() parameters (Tutorial Style, .buffer):', JSON.stringify(onnxRunParams, (key, value) => {
+        if (key === 'data' && value instanceof ArrayBuffer) { // 主要显示 ArrayBuffer
+          return `ArrayBuffer(byteLength:${value.byteLength})`;
+        }
+        return value;
+      }, 2));
+
+      const outputMap = await this.data.onnxSession.run(onnxRunParams);
+
+      const rawOutput = outputMap[outputName];
+      
+      if (rawOutput && rawOutput.data instanceof ArrayBuffer) {
+        console.log('原始输出 rawOutput:', rawOutput);
+        const outputArray = new Float32Array(rawOutput.data);
+        console.log('解析后的输出数组 (前10个值):', outputArray.slice(0, 10)); // 打印前10个看看
+
+        // 找到得分最高的索引 (ArgMax)
+        let maxScore = -Infinity;
+        let maxIndex = -1;
+        for (let i = 0; i < outputArray.length; i++) {
+          if (outputArray[i] > maxScore) {
+            maxScore = outputArray[i];
+            maxIndex = i;
+          }
+        }
+        console.log(`最高得分: ${maxScore}, 对应索引: ${maxIndex}`);
+        
+        // TODO: 根据 maxIndex 查询类别名称 (需要一个类别映射表)
+        // 例如: const className = imagenetClasses[maxIndex];
+        // this.setData({ ocrResultText: `类别: ${className} (得分: ${maxScore.toFixed(2)})` });
+
+        this.setData({ processing: false }); // 推理完成，重置状态
+        return { index: maxIndex, score: maxScore }; // 返回一个简化结果，或整个 outputArray
+
+      } else {
+        console.error(`未能从模型输出 outputMap 中获取名为 '${outputName}' 的有效张量。OutputMap:`, outputMap);
+        this.setData({ processing: false });
+        return null;
+      }
+    } catch (error) {
+      console.error('ONNX 推理失败 (session.run await):', error);
+      this.setData({ processing: false });
+      return null;
+    }
   },
 
   cropImage(frame, bbox) {
@@ -134,53 +286,76 @@ Page({
   // --- 初始化 ONNX 和 OCR 的函数占位符 ---
   initOnnxSession() {
     console.log('初始化 ONNX 会话');
-    const modelFileName = 'best.onnx'; // 使用你的模型文件名
-    const modelPathUser = `${wx.env.USER_DATA_PATH}/${modelFileName}`; // 模型在用户目录的目标路径
-    const modelPathProject = 'model/best.onnx'; // 模型在项目包内的正确相对路径 (miniprogram/model/best.onnx)
-                                                
-    console.log(`用户数据目录目标路径: ${modelPathUser}`);
-    console.log(`项目包内源路径: ${modelPathProject}`);
+    const modelFileNameInApp = 'mobilenetv2-7.onnx'; // <--- 修改这里
+    const modelUrl = 'https://raw.githubusercontent.com/qwe4559999/Chem-miniprogram/main/mobilenetv2-7.onnx'; // <--- 修改这里
+    const modelPathUser = `${wx.env.USER_DATA_PATH}/${modelFileNameInApp}`;
+
+    console.log(`模型下载链接: ${modelUrl}`);
+    console.log(`模型将保存到用户路径: ${modelPathUser}`);
 
     const fs = wx.getFileSystemManager();
 
-    // 封装加载模型的逻辑
-    const loadModel = () => {
-        console.log('尝试加载模型...');
-        try {
-            const session = wx.createInferenceSession({ model: modelPathUser });
-            console.log('ONNX session 创建成功');
-            this.setData({ onnxSession: session });
-        } catch (err) {
-            console.error('创建 ONNX session 失败:', err);
-            wx.showToast({ title: '模型加载失败', icon: 'error' });
-        }
+    const loadAndCreateSession = (filePath) => {
+      console.log(`尝试从路径创建 ONNX session: ${filePath}`);
+      try {
+        const session = wx.createInferenceSession({ model: filePath });
+        
+        session.onLoad(() => {
+          console.log('ONNX session 加载成功 (onLoad event)!');
+          this.setData({ onnxSession: session });
+          wx.showToast({ title: '模型加载完毕', icon: 'success', duration: 1500 });
+        });
+
+        session.onError((err) => {
+          console.error('ONNX session 加载失败 (onError event):', err);
+          let errMsg = '模型内部加载失败';
+          if (err && err.errMsg) {
+            if (err.errMsg.includes('Illegal onnx model name')) {
+              errMsg = '模型文件名错误';
+            } else if (err.errMsg.includes('model file not found')) {
+              errMsg = '模型文件未找到';
+            }
+          }
+          wx.showToast({ title: errMsg, icon: 'error', duration: 3500 });
+          this.setData({ onnxSession: null });
+        });
+
+      } catch (err) {
+        console.error('wx.createInferenceSession 调用时直接抛出错误:', err);
+        wx.showToast({ title: '模型创建调用失败', icon: 'error', duration: 3000 });
+        this.setData({ onnxSession: null });
+      }
     };
 
-    // 1. 检查模型是否已存在于用户数据目录
-    fs.access({
-        path: modelPathUser,
-        success: (res) => {
-            console.log('模型文件已存在于用户目录，直接加载。');
-            loadModel(); // 文件已存在，直接加载
-        },
-        fail: (err) => {
-            console.log('模型文件不在用户目录，尝试从项目包复制...');
-            // 2. 如果不存在，尝试从项目包内复制
-            fs.copyFile({
-                srcPath: modelPathProject, // 源文件路径（包内）
-                destPath: modelPathUser,   // 目标文件路径（用户目录）
-                success: (res) => {
-                    console.log('模型文件复制成功，开始加载。');
-                    loadModel(); // 复制成功后加载
-                },
-                fail: (copyErr) => {
-                    console.error(`模型文件复制失败: src=${modelPathProject}, dest=${modelPathUser}`, copyErr);
-                    wx.showToast({ title: '模型复制失败', icon: 'error', duration: 3000 });
-                    // 检查 modelPathProject 是否正确指向了包内文件
-                    // 也可能是包体积过大、权限等问题
-                }
-            });
+    wx.downloadFile({
+      url: modelUrl,
+      success: (res) => {
+        if (res.statusCode === 200) {
+          console.log('模型下载成功，临时路径:', res.tempFilePath);
+          
+          fs.saveFile({
+            tempFilePath: res.tempFilePath,
+            filePath: modelPathUser,
+            success: (saveRes) => {
+              console.log(`模型已成功保存到用户目录: ${modelPathUser}`);
+              loadAndCreateSession(modelPathUser);
+            },
+            fail: (saveErr) => {
+              console.error('保存下载的模型文件失败:', saveErr);
+              wx.showToast({ title: '模型保存失败', icon: 'error', duration: 3000 });
+              this.setData({ onnxSession: null });
+            }
+          });
+        } else {
+          console.error('下载模型文件失败，状态码:', res.statusCode);
+          wx.showToast({ title: `下载失败(${res.statusCode})`, icon: 'error', duration: 3000 });
         }
+      },
+      fail: (err) => {
+        console.error('wx.downloadFile 调用失败:', err);
+        wx.showToast({ title: '模型下载请求失败', icon: 'error', duration: 3000 });
+        this.setData({ onnxSession: null });
+      }
     });
   },
 
@@ -188,18 +363,16 @@ Page({
     console.log('初始化 OCR 会话');
     if (!wx.createVKSession) {
       console.error('当前基础库版本不支持 VKSession');
-      // wx.showToast({ title: 'OCR功能不可用', icon: 'error', duration: 3000 }); // 模拟器中不弹窗
       return;
     }
     try {
       const ocrSession = wx.createVKSession({ 
-          track: { OCR: { mode: 2 } }, // 使用静态图片检测模式
+          track: { OCR: { mode: 2 } },
       });
 
       ocrSession.start(err => {
         if (err) { 
             console.error('OCR session 启动失败', err);
-            // wx.showToast({ title: 'OCR启动失败', icon: 'error' }); // 模拟器中不弹窗
             return; 
         }
         console.log('OCR session 启动成功');
@@ -207,7 +380,7 @@ Page({
         
         ocrSession.on('updateAnchors', ({ anchors }) => {
           if (anchors && anchors.length > 0) {
-            const texts = anchors.map(anchor => anchor.text).join('\n');
+            const texts = anchors.map(anchor => anchor.text).join('\\n');
             console.log('OCR 识别结果:', texts);
             this.setData({ ocrResultText: texts, processing: false });
           } else {
@@ -224,7 +397,6 @@ Page({
       });
     } catch (err) {
       console.error('创建 OCR session 失败', err);
-      // wx.showToast({ title: 'OCR初始化失败', icon: 'error' }); // 模拟器中不弹窗
     }
   },
 
@@ -233,4 +405,4 @@ Page({
     wx.showToast({ title: '相机出错', icon: 'error' });
     this.setData({ cameraReady: false });
   }
-}) 
+})
