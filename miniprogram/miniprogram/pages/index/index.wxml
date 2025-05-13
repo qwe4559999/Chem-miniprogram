@@ -1,0 +1,15 @@
+<view class="container">
+  <camera 
+    id="camera"
+    device-position="back"
+    flash="off"
+    binderror="cameraError"
+    frame-size="medium" 
+    style="width: 100%; height: 100%;" 
+    class="camera-container"
+  ></camera>
+  
+  <view class="result-container">
+    <text class="result-text">识别结果：{{ocrResultText}}</text>
+  </view>
+</view> 

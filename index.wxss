@@ -1,0 +1,24 @@
+'''page {
+  width: 100%;
+  height: 100%;
+}
+
+.camera-container {
+  width: 100%;
+  height: 80%; /* 留出下方空间显示结果 */
+}
+
+.result-container {
+  width: 100%;
+  height: 20%;
+  padding: 10px;
+  box-sizing: border-box;
+  background-color: #f0f0f0;
+  overflow-y: scroll; /* 如果结果多，可以滚动 */
+}
+
+.result-text {
+  font-size: 14px;
+  color: #333;
+}
+''' 

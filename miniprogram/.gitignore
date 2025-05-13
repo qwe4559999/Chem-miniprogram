@@ -1,0 +1,22 @@
+# Node specific
+node_modules/
+npm-debug.log
+yarn-error.log
+venv/
+
+# WX specific
+/miniprogram_npm/
+/project.private.config.json
+# /project.config.json # 通常包含个人 appid，可选忽略。如果你希望在仓库中保留项目配置，请注释掉这行
+/build/
+*.env.*.local
+*.env.local
+
+# OS generated files #
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db 
